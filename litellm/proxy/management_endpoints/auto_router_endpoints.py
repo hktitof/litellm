@@ -41,6 +41,7 @@ from litellm.repositories.base_repository import SupportsModelDump
 from litellm.repositories.team_repository import TeamRepository
 from litellm.router_strategy.complexity_router import ComplexityRouter
 from litellm.router_utils.auto_router_model_naming import (
+    AUTO_ROUTER_MODEL_PREFIX,
     StrategyRouterDependencyRole,
     classify_strategy_router_model,
     strategy_router_dependencies,
@@ -65,6 +66,7 @@ from litellm.types.management_endpoints.auto_router_endpoints import (
     ShadowEvalTargetType,
     StartShadowEvalRequest,
 )
+from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
 
 if TYPE_CHECKING:
     from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -196,18 +198,23 @@ async def _query_raw(prisma_client: "PrismaClient", query: str, *args: object) -
     return await prisma_client.db.query_raw(query, *args)
 
 
+_DRY_RUN_PLACEHOLDER_NAME: Final = "litellm-auto-router-dry-run"
+
+
 async def _authorize_router_dry_run(user_api_key_dict: UserAPIKeyAuth, team_id: str | None) -> None:
     """Allow exactly the callers who could create this router.
 
     Both dry runs are gated like the write they rehearse rather than as reads: a proxy
-    admin, or a team admin naming their own team, matching /model/new. Routing a test
+    admin, a team admin naming their own team, or a team member whose team grants
+    auto-router management, matching /model/new for a complexity router. Routing a test
     prompt can also spend money (an `llm` classifier config calls its classifier, a
     semantic config embeds the prompt), so a read-level gate would be too loose anyway.
     """
     from litellm.proxy.management_endpoints.model_management_endpoints import (
         ModelManagementAuthChecks,
+        ModelWrite,
     )
-    from litellm.proxy.proxy_server import premium_user, prisma_client
+    from litellm.proxy.proxy_server import llm_router, premium_user, prisma_client
 
     if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
         return
@@ -239,11 +246,22 @@ async def _authorize_router_dry_run(user_api_key_dict: UserAPIKeyAuth, team_id: 
             },
         )
 
+    # The create this rehearses: a new complexity router under a name the write itself will supply.
+    rehearsed_create: Final = ModelWrite(
+        stored=None,
+        incoming=Deployment(
+            model_name=_DRY_RUN_PLACEHOLDER_NAME,
+            litellm_params=LiteLLM_Params(model=f"{AUTO_ROUTER_MODEL_PREFIX}complexity_router"),
+            model_info=ModelInfo(team_id=team_id),
+        ),
+    )
     ModelManagementAuthChecks.can_user_make_team_model_call(
         team_id=team_id,
         user_api_key_dict=user_api_key_dict,
         team_obj=LiteLLM_TeamTable.model_validate(team_row.model_dump()),
         premium_user=premium_user,
+        member_write=rehearsed_create,
+        llm_router=llm_router,
     )
 
 
